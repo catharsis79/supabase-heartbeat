@@ -2,22 +2,76 @@ name: Supabase Heartbeat
 
 on:
   schedule:
-    # Cron in GitHub Actions è in UTC e gira sul default branch
-    - cron: "0 7 * * 1,5"  # Lun e Ven alle 07:00 UTC
+    # Cron GitHub Actions è in UTC
+    - cron: "0 7 * * 1,5"   # Lun e Ven 07:00 UTC
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
-      - name: Call Edge Function
+      - name: Call Supabase Edge Function heartbeat
+        shell: bash
         env:
           HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
           HEARTBEAT_SECRET: ${{ secrets.HEARTBEAT_SECRET }}
+          # Opzionale: se "Verify JWT" è ON sulla function, imposta anche questo secret in GitHub
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           set -euo pipefail
-          code=$(curl -sS -o /dev/null -w "%{http_code}" \
-            -H "x-heartbeat-secret: $HEARTBEAT_SECRET" \
-            "$HEARTBEAT_URL")
-          echo "HTTP $code"
-          test "$code" = "200"
+
+          if [[ -z "${HEARTBEAT_URL:-}" ]]; then
+            echo "Missing HEARTBEAT_URL secret"
+            exit 1
+          fi
+
+          if [[ -z "${HEARTBEAT_SECRET:-}" ]]; then
+            echo "Missing HEARTBEAT_SECRET secret"
+            exit 1
+          fi
+
+          headers_file="$(mktemp)"
+          body_file="$(mktemp)"
+
+          # Costruzione headers curl
+          curl_headers=(
+            -H "x-heartbeat-secret: ${HEARTBEAT_SECRET}"
+            -H "Accept: text/plain"
+          )
+
+          # Se Verify JWT è ON, l'anon key funziona come Bearer JWT (opzionale)
+          if [[ -n "${SUPABASE_ANON_KEY:-}" ]]; then
+            curl_headers+=(
+              -H "apikey: ${SUPABASE_ANON_KEY}"
+              -H "Authorization: Bearer ${SUPABASE_ANON_KEY}"
+            )
+          fi
+
+          echo "Pinging: ${HEARTBEAT_URL}"
+          http_code="$(curl -sS \
+            --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 30 \
+            -D "${headers_file}" \
+            -o "${body_file}" \
+            -w "%{http_code}" \
+            "${curl_headers[@]}" \
+            "${HEARTBEAT_URL}"
+          )"
+
+          echo "HTTP ${http_code}"
+
+          if [[ "${http_code}" != "200" ]]; then
+            echo "---- Response headers ----"
+            sed -n '1,80p' "${headers_file}" || true
+            echo "---- Response body (first 300 chars) ----"
+            head -c 300 "${body_file}" || true
+            echo
+            exit 1
+          fi
+
+          echo "OK"
